@@ -113,6 +113,12 @@ const HEAVY_DO_ROUTE_METHODS = new Map([
   ["/api/two-factor/get-webauthn", new Set(["POST"])],
   ["/api/two-factor/get-webauthn-challenge", new Set(["POST"])],
   ["/api/two-factor/webauthn", new Set(["POST", "PUT", "DELETE"])],
+
+  // WebAuthn
+  ["/api/webauthn", new Set(["POST", "PUT"])],
+  ["/api/webauthn/attestation-options", new Set(["POST"])],
+  ["/api/webauthn/assertion-options", new Set(["POST"])],
+  ["/api/webauthn/{id}/delete", new Set(["POST"])],
 ]);
 
 function shouldOffloadToHeavyDo(request, url) {

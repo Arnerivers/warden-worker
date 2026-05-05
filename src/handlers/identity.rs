@@ -88,6 +88,9 @@ pub struct TokenRequest {
     device_name: Option<String>,
     #[serde(rename = "device_type", alias = "deviceType", alias = "devicetype")]
     device_type: Option<String>,
+    // WebAuthn passkey login
+    #[serde(rename = "deviceResponse", alias = "device_response")]
+    device_response: Option<String>,
 }
 
 #[derive(Debug)]
@@ -149,6 +152,8 @@ pub struct UserDecryptionOptions {
     pub has_master_password: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub master_password_unlock: Option<serde_json::Value>,
+    #[serde(rename = "WebAuthnPrfOption", skip_serializing_if = "Option::is_none")]
+    pub webauthn_prf_option: Option<serde_json::Value>,
     pub object: String,
 }
 
@@ -438,6 +443,17 @@ fn generate_tokens_and_response(
     env: &Arc<Env>,
     two_factor_token: Option<String>,
 ) -> Result<Json<TokenResponse>, AppError> {
+    generate_tokens_and_response_with_prf(user, device, client_id, env, two_factor_token, None)
+}
+
+fn generate_tokens_and_response_with_prf(
+    user: User,
+    device: &Device,
+    client_id: &str,
+    env: &Arc<Env>,
+    two_factor_token: Option<String>,
+    webauthn_prf_option: Option<serde_json::Value>,
+) -> Result<Json<TokenResponse>, AppError> {
     let now = Utc::now();
     let expires_in = Duration::hours(1);
     let time_options = jwt_time_options();
@@ -525,6 +541,7 @@ fn generate_tokens_and_response(
         user_decryption_options: UserDecryptionOptions {
             has_master_password,
             master_password_unlock,
+            webauthn_prf_option,
             object: "userDecryptionOptions".to_string(),
         },
         account_keys,
@@ -770,6 +787,87 @@ pub async fn token(
                 two_factor_remember_token,
             )
         }
+        "webauthn" => {
+            let device_response_str =
+                required_field(payload.device_response.as_deref(), "deviceResponse")?;
+            let device_request = DeviceAuthRequest {
+                client_id: required_field(payload.client_id.as_deref(), "client_id")?,
+                identifier: required_field(
+                    payload.device_identifier.as_deref(),
+                    "device_identifier",
+                )?,
+                name: required_field(payload.device_name.as_deref(), "device_name")?,
+                r#type: parse_required_device_type(payload.device_type.as_deref(), "device_type")?,
+            };
+
+            let config = webauthn::build_passkey_config(&base_url);
+            let store =
+                webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+            let now_ms = webauthn::now_ms();
+
+            let compat_response: webauthn::compat::LoginResponseCompat =
+                serde_json::from_str(&device_response_str).map_err(|e| {
+                    log::error!("Failed to parse WebAuthn login response: {e}");
+                    AppError::BadRequest("Invalid deviceResponse".to_string())
+                })?;
+            let credential_id = compat_response.id.clone();
+            let login_response: passkey_server::types::LoginResponse = compat_response.into();
+
+            let user_id =
+                webauthn::login::finish_login_assertion(&store, &config, login_response, now_ms)
+                    .await?;
+
+            let user = load_user_by_id(&db, &user_id).await?;
+
+            let mut device = Device::get_or_create(
+                &db,
+                device_request.identifier,
+                user.id.clone(),
+                device_request.name,
+                device_request.r#type,
+            )
+            .await?;
+            device.touch(&db).await?;
+
+            if device.push_token.is_some() && device.is_push_device() {
+                if let Ok(Some(cfg)) = push::push_config(&env) {
+                    match push::register_push_device(&cfg, &mut device).await {
+                        Ok(push_uuid_created) => {
+                            if push_uuid_created {
+                                if let Err(e) = device.persist_push_uuid(&db).await {
+                                    log::warn!("Push uuid persistence on login failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Push re-registration on login failed: {e}");
+                        }
+                    }
+                }
+            }
+
+            // Look up PRF material for the authenticated credential
+            let prf_option = if let Some(row_id) =
+                webauthn::store::get_login_row_id_by_credential_id(&db, &credential_id).await?
+            {
+                let creds = webauthn::store::list_login_credentials_with_prf(&db, &user.id).await?;
+                creds
+                    .iter()
+                    .find(|c| c.id == row_id)
+                    .and_then(|c| c.to_prf_option())
+            } else {
+                None
+            };
+
+            generate_tokens_and_response_with_prf(
+                user,
+                &device,
+                &device_request.client_id,
+                &env,
+                None,
+                prf_option,
+            )
+        }
         "refresh_token" => {
             // When a refresh token is invalid or missing we need to respond with an HTTP BadRequest (400)
             // It also needs to return a json which holds at least a key `error` with the value `invalid_grant`
@@ -848,4 +946,29 @@ fn json_err_twofactor(providers: &[i32], webauthn_assertion: Option<&Value>) -> 
     }
 
     result
+}
+
+// ── GET /identity/accounts/webauthn/assertion-options ────────────────────────
+//
+// Anonymous endpoint: generates discoverable-credential assertion options
+// for passkey login (no user context needed).
+
+#[worker::send]
+pub async fn webauthn_assertion_options(
+    State(env): State<Arc<Env>>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let config = webauthn::build_passkey_config(&base_url);
+    let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+    let now_ms = webauthn::now_ms();
+
+    let opts = webauthn::login::start_login_assertion(&store, &config, now_ms).await?;
+    let options_json = opts.to_bitwarden_json();
+
+    Ok(Json(serde_json::json!({
+        "options": options_json,
+        "token": null,
+        "object": "webAuthnLoginAssertionOptions"
+    })))
 }

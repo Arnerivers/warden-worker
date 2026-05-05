@@ -27,6 +27,10 @@ pub fn api_router(env: Env) -> Router {
         )
         .route("/identity/connect/token", post(identity::token))
         .route(
+            "/identity/accounts/webauthn/assertion-options",
+            get(identity::webauthn_assertion_options),
+        )
+        .route(
             "/identity/accounts/register/send-verification-email",
             post(accounts::send_verification_email),
         )
@@ -231,8 +235,22 @@ pub fn api_router(env: Env) -> Router {
             "/api/devices/identifier/{device_id}/clear-token",
             post(devices::post_clear_device_token),
         )
-        // WebAuthn (stub - prevents 404 errors, passkeys not supported)
+        // WebAuthn login passkey management
         .route("/api/webauthn", get(webauth::get_webauthn_credentials))
+        .route(
+            "/api/webauthn/attestation-options",
+            post(webauth::post_attestation_options),
+        )
+        .route("/api/webauthn", post(webauth::post_webauthn_credential))
+        .route(
+            "/api/webauthn/assertion-options",
+            post(webauth::post_assertion_options),
+        )
+        .route("/api/webauthn", put(webauth::put_webauthn_credential))
+        .route(
+            "/api/webauthn/{id}/delete",
+            post(webauth::delete_webauthn_credential),
+        )
         // Two-factor authentication
         .route("/api/two-factor", get(twofactor::get_twofactor))
         .route(

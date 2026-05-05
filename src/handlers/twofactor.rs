@@ -126,7 +126,7 @@ pub async fn get_authenticator(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(&user, &data).await?;
+    user.verify_password_or_otp(&data).await?;
 
     // Check if TOTP is already configured
     let existing: Option<Value> = db
@@ -164,13 +164,10 @@ pub async fn activate_authenticator(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(
-        &user,
-        &PasswordOrOtpData {
-            master_password_hash: data.master_password_hash,
-            otp: data.otp,
-        },
-    )
+    user.verify_password_or_otp(&PasswordOrOtpData {
+        master_password_hash: data.master_password_hash,
+        otp: data.otp,
+    })
     .await?;
 
     let key = data.key.to_uppercase();
@@ -262,13 +259,10 @@ pub async fn disable_twofactor(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(
-        &user,
-        &PasswordOrOtpData {
-            master_password_hash: data.master_password_hash,
-            otp: data.otp,
-        },
-    )
+    user.verify_password_or_otp(&PasswordOrOtpData {
+        master_password_hash: data.master_password_hash,
+        otp: data.otp,
+    })
     .await?;
 
     let type_ = data.r#type;
@@ -318,13 +312,10 @@ pub async fn disable_authenticator(
     }
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(
-        &user,
-        &PasswordOrOtpData {
-            master_password_hash: data.master_password_hash,
-            otp: data.otp,
-        },
-    )
+    user.verify_password_or_otp(&PasswordOrOtpData {
+        master_password_hash: data.master_password_hash,
+        otp: data.otp,
+    })
     .await?;
 
     // Fetch existing TOTP and verify key matches before deleting
@@ -389,28 +380,12 @@ pub async fn get_recover(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(&user, &data).await?;
+    user.verify_password_or_otp(&data).await?;
 
     Ok(Json(serde_json::json!({
         "code": user.totp_recover,
         "object": "twoFactorRecover"
     })))
-}
-
-// Helper functions
-
-async fn validate_password_or_otp(user: &User, data: &PasswordOrOtpData) -> Result<(), AppError> {
-    if let Some(ref password_hash) = data.master_password_hash {
-        let verification = user.verify_master_password(password_hash).await?;
-        if verification.is_valid() {
-            return Ok(());
-        }
-    }
-
-    // OTP validation would be handled here if we had protected actions support
-    // For now, master password is required
-
-    Err(AppError::BadRequest("Invalid password".to_string()))
 }
 
 async fn generate_recovery_code_for_user(
@@ -484,7 +459,7 @@ pub async fn get_webauthn_twofactor(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(&user, &data).await?;
+    user.verify_password_or_otp(&data).await?;
 
     let creds = webauthn::store::list_twofactor_credentials(&db, &user_id).await?;
     let keys = webauthn_keys_json(&creds)?;
@@ -507,7 +482,7 @@ pub async fn get_webauthn_challenge(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(&user, &data).await?;
+    user.verify_password_or_otp(&data).await?;
 
     let config = webauthn::build_passkey_config(&base_url);
     let store =
@@ -559,13 +534,10 @@ pub async fn activate_webauthn(
     } = data;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(
-        &user,
-        &PasswordOrOtpData {
-            master_password_hash,
-            otp,
-        },
-    )
+    user.verify_password_or_otp(&PasswordOrOtpData {
+        master_password_hash,
+        otp,
+    })
     .await?;
 
     let provider_id = id.try_i32()?;
@@ -624,13 +596,10 @@ pub async fn delete_webauthn(
     let db = db::get_db(&env)?;
 
     let user = load_user(&db, &user_id).await?;
-    validate_password_or_otp(
-        &user,
-        &PasswordOrOtpData {
-            master_password_hash: data.master_password_hash,
-            otp: data.otp,
-        },
-    )
+    user.verify_password_or_otp(&PasswordOrOtpData {
+        master_password_hash: data.master_password_hash,
+        otp: data.otp,
+    })
     .await?;
 
     let provider_id = data.id.try_i32()?;
@@ -656,14 +625,7 @@ pub async fn delete_webauthn(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 async fn load_user(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
-    let user_value: Value = db
-        .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.into()])?
-        .first(None)
-        .await
-        .map_err(|_| AppError::Database)?
-        .ok_or_else(|| AppError::Unauthorized("User not found".into()))?;
-    serde_json::from_value(user_value).map_err(|_| AppError::Internal)
+    User::find_by_id(db, user_id).await
 }
 
 /// Build the `keys` array for WebAuthn 2FA response (Vaultwarden-compatible integer IDs).

@@ -1,4 +1,5 @@
 pub mod compat;
+pub mod login;
 pub mod store;
 pub mod twofactor;
 

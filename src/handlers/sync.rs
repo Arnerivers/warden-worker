@@ -15,6 +15,7 @@ use crate::{
         sync::Profile,
         user::User,
     },
+    webauthn,
 };
 
 use ciphers::RawJson;
@@ -92,11 +93,22 @@ pub async fn get_sync_data(
     let profile_json = serde_json::to_string(&profile).map_err(|_| AppError::Internal)?;
     let folders_json = serde_json::to_string(&folders).map_err(|_| AppError::Internal)?;
 
-    // Build response JSON via string concatenation (ciphers already raw JSON)
-    let user_decryption_json = serde_json::to_string(&json!({
+    // Build userDecryption including PRF options for login passkeys
+    let login_creds_with_prf =
+        webauthn::store::list_login_credentials_with_prf(&db, &user_id).await?;
+    let prf_options: Vec<Value> = login_creds_with_prf
+        .iter()
+        .filter_map(|c| c.to_prf_option())
+        .collect();
+
+    let mut user_decryption = json!({
         "masterPasswordUnlock": master_password_unlock
-    }))
-    .map_err(|_| AppError::Internal)?;
+    });
+    if !prf_options.is_empty() {
+        user_decryption["webAuthnPrfOptions"] = Value::Array(prf_options);
+    }
+    let user_decryption_json =
+        serde_json::to_string(&user_decryption).map_err(|_| AppError::Internal)?;
 
     const DEFAULT_SYNC_RESPONSE_PREALLOC_BYTES: usize = 1024 * 1024;
 

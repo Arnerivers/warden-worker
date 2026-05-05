@@ -25,9 +25,6 @@ ng-dropdown-panel div.ng-dropdown-panel-items div:has(> [title="DuckDuckGo"]),
 .vw-or-text,
 .vw-other-login,
 
-/* Passkey/WebAuthn login UI (newer builds, if present) */
-.vw-passkey-login,
-
 /* Org-related / enterprise UI */
 app-organization-plans > form > bit-section:nth-child(2),
 app-org-account form.ng-untouched:nth-child(5),

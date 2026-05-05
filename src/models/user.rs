@@ -72,6 +72,30 @@ impl User {
             .transpose()
     }
 
+    pub async fn find_by_id(db: &crate::db::Db, user_id: &str) -> Result<Self, AppError> {
+        let row: Value = db
+            .prepare("SELECT * FROM users WHERE id = ?1")
+            .bind(&[user_id.into()])?
+            .first(None)
+            .await
+            .map_err(|_| AppError::Database)?
+            .ok_or_else(|| AppError::Unauthorized("User not found".into()))?;
+        serde_json::from_value(row).map_err(|_| AppError::Internal)
+    }
+
+    /// Verify the user's identity via master password hash.
+    pub async fn verify_password_or_otp(&self, data: &PasswordOrOtpData) -> Result<(), AppError> {
+        if let Some(ref password_hash) = data.master_password_hash {
+            if !password_hash.is_empty() {
+                let verification = self.verify_master_password(password_hash).await?;
+                if verification.is_valid() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(AppError::BadRequest("Invalid password".to_string()))
+    }
+
     pub async fn verify_master_password(
         &self,
         provided_hash: &str,
@@ -250,6 +274,16 @@ pub struct RotateKeyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RotateAccountUnlockData {
     pub master_password_unlock_data: MasterPasswordUnlockData,
+    #[serde(default)]
+    pub passkey_unlock_data: Vec<WebAuthnRotateKeyData>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebAuthnRotateKeyData {
+    pub id: String,
+    pub encrypted_user_key: String,
+    pub encrypted_public_key: String,
 }
 
 #[derive(Debug, Deserialize)]
