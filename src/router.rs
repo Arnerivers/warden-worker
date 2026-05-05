@@ -260,5 +260,26 @@ pub fn api_router(env: Env) -> Router {
             put(twofactor::disable_twofactor_put),
         )
         .route("/api/two-factor/get-recover", post(twofactor::get_recover))
+        // Two-factor WebAuthn management
+        .route(
+            "/api/two-factor/get-webauthn",
+            post(twofactor::get_webauthn_twofactor),
+        )
+        .route(
+            "/api/two-factor/get-webauthn-challenge",
+            post(twofactor::get_webauthn_challenge),
+        )
+        .route(
+            "/api/two-factor/webauthn",
+            post(twofactor::activate_webauthn),
+        )
+        .route(
+            "/api/two-factor/webauthn",
+            put(twofactor::activate_webauthn),
+        )
+        .route(
+            "/api/two-factor/webauthn",
+            delete(twofactor::delete_webauthn),
+        )
         .with_state(app_state)
 }

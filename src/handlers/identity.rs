@@ -1,4 +1,4 @@
-use axum::{extract::State, http::HeaderMap, Form, Json};
+use axum::{extract::State, http::HeaderMap, Extension, Form, Json};
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
 use jwt_compact::AlgorithmExt;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use worker::Env;
 
 use crate::d1_query;
+use crate::webauthn::twofactor::ToBitwardenJson;
 use crate::{
     auth::{jwt_time_options, Claims},
     client_context::{parse_required_device_type, request_ip_from_headers},
@@ -17,7 +18,7 @@ use crate::{
     error::AppError,
     handlers::{
         allow_totp_drift, server_password_iterations,
-        twofactor::{is_twofactor_enabled, list_user_twofactors},
+        twofactor::{active_provider_ids, list_user_twofactors},
     },
     models::{
         auth_request::AuthRequest,
@@ -25,7 +26,7 @@ use crate::{
         twofactor::{TwoFactor, TwoFactorType},
         user::User,
     },
-    push,
+    push, webauthn, BaseUrl,
 };
 
 const PASSWORD_SCOPE: &str = "api offline_access";
@@ -353,47 +354,81 @@ fn validate_remember_token(
     user: &User,
     device: &Device,
     raw_token: &str,
-    twofactor_ids: &[i32],
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
     let key = Hs256Key::new(secret.as_bytes());
-    let token = UntrustedToken::new(raw_token)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
-    let token = jwt_compact::alg::Hs256
+    let token = match UntrustedToken::new(raw_token) {
+        Ok(token) => token,
+        Err(_) => return Ok(false),
+    };
+    let token = match jwt_compact::alg::Hs256
         .validator::<RememberJwtClaims>(&key)
         .validate(&token)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+    {
+        Ok(token) => token,
+        Err(_) => return Ok(false),
+    };
     let time_options = jwt_time_options();
-    token
-        .claims()
-        .validate_expiration(&time_options)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
-    token
-        .claims()
-        .validate_maturity(&time_options)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+    if token.claims().validate_expiration(&time_options).is_err()
+        || token.claims().validate_maturity(&time_options).is_err()
+    {
+        return Ok(false);
+    }
 
     let remember_claims = token.into_parts().1.custom;
     if remember_claims.iss != REMEMBER_TOKEN_ISSUER
         || remember_claims.sub.as_str() != device.identifier.as_str()
         || remember_claims.user_uuid.as_str() != user.id.as_str()
     {
-        return Err(AppError::TwoFactorRequired(json_err_twofactor(
-            twofactor_ids,
-        )));
+        return Ok(false);
     }
 
-    let stored_token = device
-        .twofactor_remember
-        .as_deref()
-        .ok_or_else(|| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+    let Some(stored_token) = device.twofactor_remember.as_deref() else {
+        return Ok(false);
+    };
     if !constant_time_eq(stored_token.as_bytes(), raw_token.as_bytes()) {
-        return Err(AppError::TwoFactorRequired(json_err_twofactor(
-            twofactor_ids,
-        )));
+        return Ok(false);
     }
 
-    Ok(())
+    Ok(true)
+}
+
+async fn build_webauthn_assertion_payload(
+    db: &crate::db::Db,
+    base_url: &str,
+    user_id: &str,
+    twofactor_ids: &[i32],
+) -> Result<Option<Value>, AppError> {
+    if !twofactor_ids.contains(&(TwoFactorType::Webauthn as i32)) {
+        return Ok(None);
+    }
+
+    let wa_creds = webauthn::store::list_twofactor_credentials(db, user_id).await?;
+    if wa_creds.is_empty() {
+        return Ok(None);
+    }
+
+    let config = webauthn::build_passkey_config(base_url);
+    let store =
+        webauthn::store::D1PasskeyStore::new(db, webauthn::store::CredentialUsage::TwoFactor);
+    let now_ms = webauthn::now_ms();
+    let opts = webauthn::twofactor::start_2fa_assertion(&store, &config, &wa_creds, now_ms).await?;
+
+    Ok(Some(opts.to_bitwarden_json()))
+}
+
+async fn build_twofactor_required_payload(
+    db: &crate::db::Db,
+    base_url: &str,
+    user_id: &str,
+    twofactor_ids: &[i32],
+) -> Result<Value, AppError> {
+    let webauthn_assertion =
+        build_webauthn_assertion_payload(db, base_url, user_id, twofactor_ids).await?;
+    Ok(json_err_twofactor(
+        twofactor_ids,
+        webauthn_assertion.as_ref(),
+    ))
 }
 
 fn generate_tokens_and_response(
@@ -500,6 +535,7 @@ fn generate_tokens_and_response(
 #[worker::send]
 pub async fn token(
     State(env): State<Arc<Env>>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     headers: HeaderMap,
     Form(payload): Form<TokenRequest>,
 ) -> Result<Json<TokenResponse>, AppError> {
@@ -538,14 +574,33 @@ pub async fn token(
             .await?;
 
             let twofactors: Vec<TwoFactor> = list_user_twofactors(&db, &user.id).await?;
-            let twofactor_ids = vec![TwoFactorType::Authenticator as i32];
+            let twofactor_ids = active_provider_ids(&twofactors);
             let mut should_issue_remember = false;
 
-            if is_twofactor_enabled(&twofactors) {
+            if !twofactor_ids.is_empty() {
                 let selected_id = payload.two_factor_provider.unwrap_or(twofactor_ids[0]);
-                let twofactor_code = payload.two_factor_token.as_deref().ok_or_else(|| {
-                    AppError::TwoFactorRequired(json_err_twofactor(&twofactor_ids))
-                })?;
+                let twofactor_code = payload.two_factor_token.as_deref();
+
+                if twofactor_code.is_none() {
+                    return Err(AppError::TwoFactorRequired(
+                        build_twofactor_required_payload(&db, &base_url, &user.id, &twofactor_ids)
+                            .await?,
+                    ));
+                }
+
+                // Validate that the selected provider is actually enabled for
+                // this user (skip Remember and RecoveryCode which are special).
+                if selected_id != TwoFactorType::Remember as i32
+                    && selected_id != TwoFactorType::RecoveryCode as i32
+                    && !twofactor_ids.contains(&selected_id)
+                {
+                    return Err(AppError::TwoFactorRequired(
+                        build_twofactor_required_payload(&db, &base_url, &user.id, &twofactor_ids)
+                            .await?,
+                    ));
+                }
+
+                let twofactor_code = twofactor_code.unwrap();
 
                 match TwoFactorType::from_i32(selected_id) {
                     Some(TwoFactorType::Authenticator) => {
@@ -576,14 +631,50 @@ pub async fn token(
 
                         should_issue_remember = payload.two_factor_remember == Some(1);
                     }
+                    Some(TwoFactorType::Webauthn) => {
+                        let config = webauthn::build_passkey_config(&base_url);
+                        let store = webauthn::store::D1PasskeyStore::new(
+                            &db,
+                            webauthn::store::CredentialUsage::TwoFactor,
+                        );
+                        let now_ms = webauthn::now_ms();
+
+                        let compat_response: webauthn::compat::LoginResponseCompat =
+                            serde_json::from_str(twofactor_code).map_err(|e| {
+                                log::error!("Failed to parse WebAuthn 2FA response: {e}");
+                                AppError::BadRequest("Invalid WebAuthn response".to_string())
+                            })?;
+                        let login_response: passkey_server::types::LoginResponse =
+                            compat_response.into();
+
+                        webauthn::twofactor::finish_2fa_assertion(
+                            &store,
+                            &config,
+                            login_response,
+                            &user.id,
+                            now_ms,
+                        )
+                        .await?;
+
+                        should_issue_remember = payload.two_factor_remember == Some(1);
+                    }
                     Some(TwoFactorType::Remember) => {
-                        validate_remember_token(
-                            env.as_ref(),
-                            &user,
-                            &device,
-                            twofactor_code,
-                            &twofactor_ids,
-                        )?;
+                        let remember_valid =
+                            validate_remember_token(env.as_ref(), &user, &device, twofactor_code)?;
+                        if !remember_valid {
+                            if device.twofactor_remember.is_some() {
+                                device.set_twofactor_remember(&db, None).await?;
+                            }
+                            return Err(AppError::TwoFactorRequired(
+                                build_twofactor_required_payload(
+                                    &db,
+                                    &base_url,
+                                    &user.id,
+                                    &twofactor_ids,
+                                )
+                                .await?,
+                            ));
+                        }
                         should_issue_remember = payload.two_factor_remember == Some(1);
                     }
                     Some(TwoFactorType::RecoveryCode) => {
@@ -594,29 +685,29 @@ pub async fn token(
                                 ));
                             }
 
-                            d1_query!(&db, "DELETE FROM twofactor WHERE user_uuid = ?1", &user.id)
-                                .map_err(|_| AppError::Database)?
-                                .run()
-                                .await
-                                .map_err(|_| AppError::Database)?;
-                            d1_query!(
-                                &db,
-                                "UPDATE users SET totp_recover = NULL WHERE id = ?1",
-                                &user.id
-                            )
-                            .map_err(|_| AppError::Database)?
-                            .run()
-                            .await
-                            .map_err(|_| AppError::Database)?;
-                            d1_query!(
-                                &db,
-                                "UPDATE devices SET twofactor_remember = NULL WHERE user_id = ?1",
-                                &user.id
-                            )
-                            .map_err(|_| AppError::Database)?
-                            .run()
-                            .await
-                            .map_err(|_| AppError::Database)?;
+                            let stmts = vec![
+                                d1_query!(&db, "DELETE FROM twofactor WHERE user_uuid = ?1", &user.id)
+                                    .map_err(|_| AppError::Database)?,
+                                d1_query!(
+                                    &db,
+                                    "DELETE FROM webauthn_credentials WHERE user_id = ?1 AND usage = 'twofactor'",
+                                    &user.id
+                                )
+                                .map_err(|_| AppError::Database)?,
+                                d1_query!(
+                                    &db,
+                                    "UPDATE users SET totp_recover = NULL WHERE id = ?1",
+                                    &user.id
+                                )
+                                .map_err(|_| AppError::Database)?,
+                                d1_query!(
+                                    &db,
+                                    "UPDATE devices SET twofactor_remember = NULL WHERE user_id = ?1",
+                                    &user.id
+                                )
+                                .map_err(|_| AppError::Database)?,
+                            ];
+                            db.batch(stmts).await.map_err(|_| AppError::Database)?;
                         } else {
                             return Err(AppError::BadRequest(
                                 "Recovery code is incorrect".to_string(),
@@ -730,8 +821,12 @@ pub async fn token(
     }
 }
 
-/// Generates the JSON error response for 2FA required
-fn json_err_twofactor(providers: &[i32]) -> Value {
+/// Generates the JSON error response for 2FA required.
+///
+/// When WebAuthn (provider 7) is active, `webauthn_assertion` carries the
+/// `PublicKeyCredentialRequestOptions` that the client needs for
+/// `navigator.credentials.get()`.
+fn json_err_twofactor(providers: &[i32], webauthn_assertion: Option<&Value>) -> Value {
     let mut result = serde_json::json!({
         "error": "invalid_grant",
         "error_description": "Two factor required.",
@@ -743,6 +838,12 @@ fn json_err_twofactor(providers: &[i32]) -> Value {
     });
 
     for provider in providers {
+        if *provider == TwoFactorType::Webauthn as i32 {
+            if let Some(opts) = webauthn_assertion {
+                result["TwoFactorProviders2"][provider.to_string()] = opts.clone();
+                continue;
+            }
+        }
         result["TwoFactorProviders2"][provider.to_string()] = Value::Null;
     }
 

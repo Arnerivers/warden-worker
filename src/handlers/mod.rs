@@ -112,7 +112,7 @@ pub(crate) fn sync_response_prealloc_bytes(env: &worker::Env) -> Option<usize> {
     }
 }
 
-/// Whether the user has 2FA enabled.
+/// Whether the user has 2FA enabled (TOTP or WebAuthn).
 pub(crate) async fn two_factor_enabled(
     db: &crate::db::Db,
     user_id: &str,

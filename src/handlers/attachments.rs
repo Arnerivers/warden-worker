@@ -25,6 +25,7 @@ use crate::{
         cipher::{Cipher, CipherDBModel},
     },
     notifications::{self, UpdateType},
+    util::NumberOrString,
     BaseUrl,
 };
 
@@ -88,13 +89,6 @@ pub struct AttachmentDeleteResponse {
     pub cipher: Cipher,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-pub enum NumberOrString {
-    Number(i64),
-    String(String),
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AttachmentClaims {
     pub sub: String,
@@ -108,28 +102,6 @@ pub(crate) struct AttachmentClaims {
 struct AttachmentKeyRow {
     cipher_id: String,
     id: String,
-}
-
-impl NumberOrString {
-    pub fn into_i64(self) -> Result<i64, AppError> {
-        match self {
-            NumberOrString::Number(v) => Ok(v),
-            NumberOrString::String(s) => s
-                .parse::<i64>()
-                .map_err(|_| AppError::BadRequest("Invalid number".into())),
-        }
-    }
-
-    #[allow(clippy::wrong_self_convention)]
-    pub fn into_i32(&self) -> Result<i32, AppError> {
-        match self {
-            NumberOrString::Number(n) => i32::try_from(*n)
-                .map_err(|_| AppError::BadRequest("Number does not fit in i32".into())),
-            NumberOrString::String(s) => s
-                .parse::<i32>()
-                .map_err(|_| AppError::BadRequest("Can't convert to number".into())),
-        }
-    }
 }
 
 pub(crate) async fn touch_cipher_updated_at(
@@ -175,7 +147,7 @@ pub async fn create_attachment_v2(
         admin_request: _,
     } = payload;
 
-    let declared_size = file_size.into_i64()?;
+    let declared_size = file_size.try_i64()?;
     if declared_size <= 0 {
         return Err(AppError::BadRequest(
             "Attachment size must be positive".to_string(),

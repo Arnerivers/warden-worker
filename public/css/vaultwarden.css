@@ -49,14 +49,8 @@ app-user-layout app-danger-zone button:nth-child(1),
 /* YubiKey */
 .providers-2fa-3,
 
-/* WebAuthn */
-.providers-2fa-7,
-
 /* Emergency access (not supported) */
-bit-nav-item[route="settings/emergency-access"],
-
-/* Passkey settings (not supported) */
-app-user-layout app-password-settings app-webauthn-login-settings {
+bit-nav-item[route="settings/emergency-access"] {
   display: none !important;
 }
 

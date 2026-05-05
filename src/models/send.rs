@@ -4,8 +4,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::d1_query;
-use crate::handlers::attachments::NumberOrString;
 use crate::models::attachment::display_size;
+use crate::util::NumberOrString;
 use crate::{db, error::AppError};
 
 #[derive(Copy, Clone, PartialEq, Eq)]

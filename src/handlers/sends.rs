@@ -181,7 +181,7 @@ fn build_send(
     );
     send.notes = payload.notes.clone();
     send.max_access_count = match &payload.max_access_count {
-        Some(m) => Some(m.into_i32()?),
+        Some(m) => Some(m.try_i32()?),
         None => None,
     };
     send.expiration_date = expiration_date;
@@ -201,7 +201,7 @@ fn apply_update(
     send.akey = payload.key.clone();
     send.notes = payload.notes.clone();
     send.max_access_count = match &payload.max_access_count {
-        Some(m) => Some(m.into_i32()?),
+        Some(m) => Some(m.try_i32()?),
         None => None,
     };
     send.expiration_date = expiration_date;
@@ -330,7 +330,7 @@ pub async fn create_file_send_v2(
         .file_length
         .clone()
         .ok_or_else(|| AppError::BadRequest("Invalid send length".into()))?
-        .into_i64()?;
+        .try_i64()?;
 
     if declared_size < 0 {
         return Err(AppError::BadRequest("Send size can't be negative".into()));
