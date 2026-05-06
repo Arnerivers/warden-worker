@@ -5,7 +5,7 @@ use std::sync::Arc;
 use worker::Env;
 
 use crate::d1_query;
-use crate::webauthn::twofactor::ToBitwardenJson;
+use crate::webauthn::ceremony::ToBitwardenJson;
 use crate::{
     auth::AuthUser,
     crypto::{base32_decode, ct_eq, generate_recovery_code, generate_totp_secret, validate_totp},
@@ -125,7 +125,7 @@ pub async fn get_authenticator(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&data).await?;
 
     // Check if TOTP is already configured
@@ -163,7 +163,7 @@ pub async fn activate_authenticator(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
@@ -258,7 +258,7 @@ pub async fn disable_twofactor(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
@@ -311,7 +311,7 @@ pub async fn disable_authenticator(
         return Err(AppError::BadRequest("Invalid two factor type".to_string()));
     }
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
@@ -379,7 +379,7 @@ pub async fn get_recover(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&data).await?;
 
     Ok(Json(serde_json::json!({
@@ -458,7 +458,7 @@ pub async fn get_webauthn_twofactor(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&data).await?;
 
     let creds = webauthn::store::list_twofactor_credentials(&db, &user_id).await?;
@@ -481,7 +481,7 @@ pub async fn get_webauthn_challenge(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&data).await?;
 
     let config = webauthn::build_passkey_config(&base_url);
@@ -490,7 +490,7 @@ pub async fn get_webauthn_challenge(
     let now_ms = webauthn::now_ms();
 
     let display_name = user.name.as_deref().unwrap_or(&email);
-    let opts = webauthn::twofactor::start_2fa_registration(
+    let opts = webauthn::ceremony::start_ceremony_registration(
         &store,
         &user_id,
         &email,
@@ -533,7 +533,7 @@ pub async fn activate_webauthn(
         name,
     } = data;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&PasswordOrOtpData {
         master_password_hash,
         otp,
@@ -554,16 +554,17 @@ pub async fn activate_webauthn(
             .with_original_name(name.clone());
     let now_ms = webauthn::now_ms();
 
-    let mut compat_response: webauthn::compat::RegistrationResponseCompat =
-        serde_json::from_value(device_response).map_err(|e| {
-            log::error!("Failed to parse WebAuthn deviceResponse: {e}");
-            AppError::BadRequest("Invalid deviceResponse".to_string())
-        })?;
-    compat_response.name = Some(name);
-    let reg_response: passkey_server::types::RegistrationResponse = compat_response.into();
+    let reg_response =
+        webauthn::compat::RegistrationResponseCompat::parse(device_response, Some(name))?;
 
-    webauthn::twofactor::finish_2fa_registration(&store, &user_id, &config, reg_response, now_ms)
-        .await?;
+    webauthn::ceremony::finish_ceremony_registration(
+        &store,
+        &user_id,
+        &config,
+        reg_response,
+        now_ms,
+    )
+    .await?;
 
     // Generate recovery code if not present
     generate_recovery_code_for_user(&db, &user_id).await?;
@@ -595,7 +596,7 @@ pub async fn delete_webauthn(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let user = load_user(&db, &user_id).await?;
+    let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&PasswordOrOtpData {
         master_password_hash: data.master_password_hash,
         otp: data.otp,
@@ -623,10 +624,6 @@ pub async fn delete_webauthn(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-async fn load_user(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
-    User::find_by_id(db, user_id).await
-}
 
 /// Build the `keys` array for WebAuthn 2FA response (Vaultwarden-compatible integer IDs).
 fn webauthn_keys_json(

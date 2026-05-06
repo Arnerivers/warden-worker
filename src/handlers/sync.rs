@@ -95,7 +95,7 @@ pub async fn get_sync_data(
 
     // Build userDecryption including PRF options for login passkeys
     let login_creds_with_prf =
-        webauthn::store::list_login_credentials_with_prf(&db, &user_id).await?;
+        webauthn::prf::list_login_credentials_with_prf(&db, &user_id).await?;
     let prf_options: Vec<Value> = login_creds_with_prf
         .iter()
         .filter_map(|c| c.to_prf_option())

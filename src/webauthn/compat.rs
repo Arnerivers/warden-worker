@@ -18,6 +18,8 @@ use base64::{
 };
 use serde::Deserialize;
 
+use crate::error::AppError;
+
 fn normalize_base64url(value: &str) -> Option<String> {
     URL_SAFE_NO_PAD
         .decode(value)
@@ -87,6 +89,24 @@ pub struct AttestationResponseCompat {
     pub attestation_object: String,
 }
 
+impl RegistrationResponseCompat {
+    /// Parse a `deviceResponse` JSON value into a `RegistrationResponse`,
+    /// optionally overriding the name (for display-name / AAGUID extraction).
+    pub fn parse(
+        value: serde_json::Value,
+        name: Option<String>,
+    ) -> Result<passkey_server::types::RegistrationResponse, AppError> {
+        let mut compat: Self = serde_json::from_value(value).map_err(|e| {
+            log::error!("Failed to parse WebAuthn registration response: {e}");
+            AppError::BadRequest("Invalid deviceResponse".into())
+        })?;
+        if name.is_some() {
+            compat.name = name;
+        }
+        Ok(compat.into())
+    }
+}
+
 impl From<RegistrationResponseCompat> for passkey_server::types::RegistrationResponse {
     fn from(c: RegistrationResponseCompat) -> Self {
         Self {
@@ -136,6 +156,30 @@ pub struct AssertionResponseCompat {
     pub signature: String,
     #[serde(default, deserialize_with = "deserialize_optional_base64url_compat")]
     pub user_handle: Option<String>,
+}
+
+impl LoginResponseCompat {
+    /// Parse a `deviceResponse` JSON value, returning `(credential_id, LoginResponse)`.
+    pub fn parse(
+        value: serde_json::Value,
+    ) -> Result<(String, passkey_server::types::LoginResponse), AppError> {
+        let compat: Self = serde_json::from_value(value).map_err(|e| {
+            log::error!("Failed to parse WebAuthn assertion response: {e}");
+            AppError::BadRequest("Invalid deviceResponse".into())
+        })?;
+        let credential_id = compat.id.clone();
+        Ok((credential_id, compat.into()))
+    }
+
+    /// Parse a `deviceResponse` JSON string, returning `(credential_id, LoginResponse)`.
+    pub fn parse_str(s: &str) -> Result<(String, passkey_server::types::LoginResponse), AppError> {
+        let compat: Self = serde_json::from_str(s).map_err(|e| {
+            log::error!("Failed to parse WebAuthn assertion response: {e}");
+            AppError::BadRequest("Invalid WebAuthn response".into())
+        })?;
+        let credential_id = compat.id.clone();
+        Ok((credential_id, compat.into()))
+    }
 }
 
 impl From<LoginResponseCompat> for passkey_server::types::LoginResponse {

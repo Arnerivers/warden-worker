@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use worker::Env;
 
-use crate::webauthn::twofactor::ToBitwardenJson;
+use crate::webauthn::ceremony::ToBitwardenJson;
 use crate::{
     auth::AuthUser,
     db,
@@ -20,7 +20,7 @@ pub async fn get_webauthn_credentials(
     AuthUser(user_id, _): AuthUser,
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
-    let creds = webauthn::store::list_login_credentials_with_prf(&db, &user_id).await?;
+    let creds = webauthn::prf::list_login_credentials_with_prf(&db, &user_id).await?;
     let data: Vec<Value> = creds.iter().map(|c| c.to_response_json()).collect();
 
     Ok(Json(json!({
@@ -47,7 +47,7 @@ pub async fn post_attestation_options(
     let now_ms = webauthn::now_ms();
     let display_name = user.name.as_deref().unwrap_or(&email);
 
-    let opts = webauthn::login::start_login_registration(
+    let opts = webauthn::ceremony::start_ceremony_registration(
         &store,
         &user_id,
         &email,
@@ -93,29 +93,28 @@ pub async fn post_webauthn_credential(
     let db = db::get_db(&env)?;
 
     let config = webauthn::build_passkey_config(&base_url);
+    let row_id = uuid::Uuid::new_v4().to_string();
     let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login)
-        .with_original_name(data.name.clone());
+        .with_original_name(data.name.clone())
+        .with_predetermined_row_id(row_id.clone());
     let now_ms = webauthn::now_ms();
 
-    let mut compat_response: webauthn::compat::RegistrationResponseCompat =
-        serde_json::from_value(data.device_response).map_err(|e| {
-            log::error!("Failed to parse WebAuthn deviceResponse: {e}");
-            AppError::BadRequest("Invalid deviceResponse".to_string())
-        })?;
-    compat_response.name = Some(data.name.clone());
-    let credential_id = compat_response.id.clone();
-    let reg_response: passkey_server::types::RegistrationResponse = compat_response.into();
+    let reg_response = webauthn::compat::RegistrationResponseCompat::parse(
+        data.device_response,
+        Some(data.name.clone()),
+    )?;
 
-    webauthn::login::finish_login_registration(&store, &user_id, &config, reg_response, now_ms)
-        .await?;
-
-    // Look up the newly-created credential by its globally-unique credential_id
-    let row_id = webauthn::store::get_login_row_id_by_credential_id(&db, &credential_id)
-        .await?
-        .ok_or(AppError::Internal)?;
+    webauthn::ceremony::finish_ceremony_registration(
+        &store,
+        &user_id,
+        &config,
+        reg_response,
+        now_ms,
+    )
+    .await?;
 
     let supports_prf = data.supports_prf.unwrap_or(false);
-    webauthn::store::create_prf_credential(
+    webauthn::prf::create_prf_credential(
         &db,
         &row_id,
         supports_prf,
@@ -126,7 +125,7 @@ pub async fn post_webauthn_credential(
     )
     .await?;
 
-    let all_creds = webauthn::store::list_login_credentials_with_prf(&db, &user_id).await?;
+    let all_creds = webauthn::prf::list_login_credentials_with_prf(&db, &user_id).await?;
     let resp_data: Vec<Value> = all_creds.iter().map(|c| c.to_response_json()).collect();
 
     Ok(Json(json!({
@@ -153,7 +152,7 @@ pub async fn post_assertion_options(
     let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
     let now_ms = webauthn::now_ms();
 
-    let opts = webauthn::login::start_login_assertion(&store, &config, now_ms).await?;
+    let opts = webauthn::ceremony::start_login_assertion(&store, &config, now_ms).await?;
     let options_json = opts.to_bitwarden_json();
 
     Ok(Json(json!({
@@ -191,26 +190,17 @@ pub async fn put_webauthn_credential(
     let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
     let now_ms = webauthn::now_ms();
 
-    let compat_response: webauthn::compat::LoginResponseCompat =
-        serde_json::from_value(data.device_response).map_err(|e| {
-            log::error!("Failed to parse WebAuthn deviceResponse: {e}");
-            AppError::BadRequest("Invalid deviceResponse".to_string())
-        })?;
-    let credential_id = compat_response.id.clone();
-    let login_response: passkey_server::types::LoginResponse = compat_response.into();
+    let (credential_id, login_response) =
+        webauthn::compat::LoginResponseCompat::parse(data.device_response)?;
 
-    let returned_user_id =
-        webauthn::login::finish_login_assertion(&store, &config, login_response, now_ms).await?;
+    webauthn::ceremony::finish_assertion(&store, &config, login_response, Some(&user_id), now_ms)
+        .await?;
 
-    if returned_user_id != user_id {
-        return Err(AppError::BadRequest("WebAuthn credential mismatch".into()));
-    }
-
-    let row_id = webauthn::store::get_login_row_id_by_credential_id(&db, &credential_id)
+    let row_id = webauthn::prf::get_login_row_id_by_credential_id(&db, &credential_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("Credential not found".into()))?;
 
-    webauthn::store::update_prf_keys(
+    webauthn::prf::update_prf_keys(
         &db,
         &row_id,
         &data.encrypted_user_key,
@@ -220,7 +210,7 @@ pub async fn put_webauthn_credential(
     )
     .await?;
 
-    let all_creds = webauthn::store::list_login_credentials_with_prf(&db, &user_id).await?;
+    let all_creds = webauthn::prf::list_login_credentials_with_prf(&db, &user_id).await?;
     let resp_data: Vec<Value> = all_creds.iter().map(|c| c.to_response_json()).collect();
 
     Ok(Json(json!({

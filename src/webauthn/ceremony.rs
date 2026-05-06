@@ -1,6 +1,5 @@
 use passkey_server::types::{
-    AuthenticatorSelection, CredentialDescriptor, PublicKeyCredentialCreationOptions,
-    PublicKeyCredentialRequestOptions,
+    CredentialDescriptor, PublicKeyCredentialCreationOptions, PublicKeyCredentialRequestOptions,
 };
 use passkey_server::{
     finish_login, finish_registration, start_login, start_registration, PasskeyConfig,
@@ -10,13 +9,10 @@ use serde_json::{json, Value};
 use super::store::{D1PasskeyStore, WebauthnCredentialRow};
 use crate::error::AppError;
 
-// ── 2FA Registration ────────────────────────────────────────────────────────
+// ── Registration ─────────────────────────────────────────────────────────────
 
-/// Generate registration options for a 2FA WebAuthn credential.
-///
-/// Calls `start_registration` then overrides `authenticator_selection` to
-/// discourage user verification (security-key behaviour).
-pub async fn start_2fa_registration(
+/// Generate registration options with usage-appropriate authenticator selection.
+pub async fn start_ceremony_registration(
     store: &D1PasskeyStore<'_>,
     user_id: &str,
     username: &str,
@@ -27,22 +23,19 @@ pub async fn start_2fa_registration(
     let mut opts = start_registration(store, user_id, username, display_name, config, now_ms)
         .await
         .map_err(|e| {
-            log::error!("WebAuthn registration start failed: {e}");
+            log::error!(
+                "WebAuthn registration start failed ({:?}): {e}",
+                store.usage(),
+            );
             AppError::BadRequest("WebAuthn registration start failed".into())
         })?;
 
-    opts.authenticator_selection = Some(AuthenticatorSelection {
-        authenticator_attachment: None,
-        require_resident_key: Some(false),
-        resident_key: None,
-        user_verification: Some("discouraged".into()),
-    });
-
+    opts.authenticator_selection = Some(store.usage().authenticator_selection());
     Ok(opts)
 }
 
-/// Complete a 2FA WebAuthn credential registration.
-pub async fn finish_2fa_registration(
+/// Complete a WebAuthn credential registration (shared for both modes).
+pub async fn finish_ceremony_registration(
     store: &D1PasskeyStore<'_>,
     user_id: &str,
     config: &PasskeyConfig,
@@ -57,13 +50,27 @@ pub async fn finish_2fa_registration(
         })
 }
 
-// ── 2FA Assertion ───────────────────────────────────────────────────────────
+// ── Assertion (Login — discoverable) ─────────────────────────────────────────
 
-/// Generate assertion options for 2FA WebAuthn challenge.
-///
-/// Uses `start_login` (which saves state as `login:{challenge}`), then
-/// overrides `allow_credentials` with the user's 2FA credential list and
-/// sets `user_verification` to `"discouraged"`.
+/// Generate discoverable-credential assertion options for passkey login.
+/// Produces empty `allowCredentials` so the browser selects a resident key.
+pub async fn start_login_assertion(
+    store: &D1PasskeyStore<'_>,
+    config: &PasskeyConfig,
+    now_ms: i64,
+) -> Result<PublicKeyCredentialRequestOptions, AppError> {
+    let mut opts = start_login(store, config, now_ms).await.map_err(|e| {
+        log::error!("Login passkey assertion start failed: {e}");
+        AppError::BadRequest("WebAuthn assertion start failed".into())
+    })?;
+
+    opts.user_verification = Some("required".into());
+    Ok(opts)
+}
+
+// ── Assertion (2FA — credential-list based) ──────────────────────────────────
+
+/// Generate 2FA assertion options with explicit `allowCredentials` list.
 pub async fn start_2fa_assertion(
     store: &D1PasskeyStore<'_>,
     config: &PasskeyConfig,
@@ -71,7 +78,7 @@ pub async fn start_2fa_assertion(
     now_ms: i64,
 ) -> Result<PublicKeyCredentialRequestOptions, AppError> {
     let mut opts = start_login(store, config, now_ms).await.map_err(|e| {
-        log::error!("WebAuthn assertion start failed: {e}");
+        log::error!("WebAuthn 2FA assertion start failed: {e}");
         AppError::BadRequest("WebAuthn assertion start failed".into())
     })?;
 
@@ -95,18 +102,19 @@ pub async fn start_2fa_assertion(
     Ok(opts)
 }
 
-/// Verify a 2FA WebAuthn assertion and return the authenticated user_id.
+// ── Shared assertion verification ────────────────────────────────────────────
+
+/// Verify a WebAuthn assertion and return the authenticated user_id.
 ///
-/// The server-side state (`LoginState`) only stores the challenge, not the
-/// allowed credential set.  Currently, we allow all the credentials
-/// that belong to the user.
-pub async fn finish_2fa_assertion(
+/// When `expected_user_id` is `Some`, the returned user must match;
+/// pass `None` for discoverable-credential login where the user is unknown.
+pub async fn finish_assertion(
     store: &D1PasskeyStore<'_>,
     config: &PasskeyConfig,
     response: passkey_server::types::LoginResponse,
-    expected_user_id: &str,
+    expected_user_id: Option<&str>,
     now_ms: i64,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let returned_user_id = finish_login(store, config, response, now_ms)
         .await
         .map_err(|e| {
@@ -114,11 +122,15 @@ pub async fn finish_2fa_assertion(
             AppError::BadRequest("WebAuthn verification failed".into())
         })?;
 
-    if returned_user_id != expected_user_id {
-        log::warn!("WebAuthn credential user mismatch: expected {expected_user_id}, got {returned_user_id}");
-        return Err(AppError::BadRequest("WebAuthn verification failed".into()));
+    if let Some(expected) = expected_user_id {
+        if returned_user_id != expected {
+            log::warn!(
+                "WebAuthn credential user mismatch: expected {expected}, got {returned_user_id}"
+            );
+            return Err(AppError::BadRequest("WebAuthn verification failed".into()));
+        }
     }
-    Ok(())
+    Ok(returned_user_id)
 }
 
 // ── JSON helpers (camelCase for Bitwarden clients) ──────────────────────────
@@ -127,8 +139,6 @@ pub trait ToBitwardenJson {
     fn to_bitwarden_json(&self) -> Value;
 }
 
-/// Serialize `PublicKeyCredentialCreationOptions` as camelCase JSON
-/// for the Bitwarden client.
 impl ToBitwardenJson for PublicKeyCredentialCreationOptions {
     fn to_bitwarden_json(&self) -> Value {
         let mut obj = json!({
@@ -181,8 +191,6 @@ impl ToBitwardenJson for PublicKeyCredentialCreationOptions {
     }
 }
 
-/// Serialize `PublicKeyCredentialRequestOptions` as camelCase JSON
-/// for the Bitwarden client's `TwoFactorProviders2["7"]`.
 impl ToBitwardenJson for PublicKeyCredentialRequestOptions {
     fn to_bitwarden_json(&self) -> Value {
         let mut obj = json!({

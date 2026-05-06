@@ -912,10 +912,10 @@ pub async fn post_rotatekey(
     // Rotate PRF keys for login passkeys
     let passkey_unlock_data = &payload.account_unlock_data.passkey_unlock_data;
     if !passkey_unlock_data.is_empty() {
-        let enabled_creds = webauthn::store::list_login_credentials_with_prf(&db, user_id).await?;
+        let enabled_creds = webauthn::prf::list_login_credentials_with_prf(&db, user_id).await?;
         let enabled_ids: Vec<&str> = enabled_creds
             .iter()
-            .filter(|c| c.prf_status() == webauthn::store::PrfStatus::Enabled)
+            .filter(|c| c.prf_status() == webauthn::prf::PrfStatus::Enabled)
             .map(|c| c.id.as_str())
             .collect();
 
@@ -929,7 +929,7 @@ pub async fn post_rotatekey(
         }
 
         let now_ms = webauthn::now_ms();
-        webauthn::store::rotate_prf_keys(&db, passkey_unlock_data, now_ms).await?;
+        webauthn::prf::rotate_prf_keys(&db, passkey_unlock_data, now_ms).await?;
     }
 
     // Generate new salt and hash the new password

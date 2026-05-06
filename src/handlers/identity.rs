@@ -9,7 +9,7 @@ use std::sync::Arc;
 use worker::Env;
 
 use crate::d1_query;
-use crate::webauthn::twofactor::ToBitwardenJson;
+use crate::webauthn::ceremony::ToBitwardenJson;
 use crate::{
     auth::{jwt_time_options, Claims},
     client_context::{parse_required_device_type, request_ip_from_headers},
@@ -417,7 +417,7 @@ async fn build_webauthn_assertion_payload(
     let store =
         webauthn::store::D1PasskeyStore::new(db, webauthn::store::CredentialUsage::TwoFactor);
     let now_ms = webauthn::now_ms();
-    let opts = webauthn::twofactor::start_2fa_assertion(&store, &config, &wa_creds, now_ms).await?;
+    let opts = webauthn::ceremony::start_2fa_assertion(&store, &config, &wa_creds, now_ms).await?;
 
     Ok(Some(opts.to_bitwarden_json()))
 }
@@ -656,19 +656,14 @@ pub async fn token(
                         );
                         let now_ms = webauthn::now_ms();
 
-                        let compat_response: webauthn::compat::LoginResponseCompat =
-                            serde_json::from_str(twofactor_code).map_err(|e| {
-                                log::error!("Failed to parse WebAuthn 2FA response: {e}");
-                                AppError::BadRequest("Invalid WebAuthn response".to_string())
-                            })?;
-                        let login_response: passkey_server::types::LoginResponse =
-                            compat_response.into();
+                        let (_, login_response) =
+                            webauthn::compat::LoginResponseCompat::parse_str(twofactor_code)?;
 
-                        webauthn::twofactor::finish_2fa_assertion(
+                        webauthn::ceremony::finish_assertion(
                             &store,
                             &config,
                             login_response,
-                            &user.id,
+                            Some(&user.id),
                             now_ms,
                         )
                         .await?;
@@ -805,16 +800,11 @@ pub async fn token(
                 webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
             let now_ms = webauthn::now_ms();
 
-            let compat_response: webauthn::compat::LoginResponseCompat =
-                serde_json::from_str(&device_response_str).map_err(|e| {
-                    log::error!("Failed to parse WebAuthn login response: {e}");
-                    AppError::BadRequest("Invalid deviceResponse".to_string())
-                })?;
-            let credential_id = compat_response.id.clone();
-            let login_response: passkey_server::types::LoginResponse = compat_response.into();
+            let (credential_id, login_response) =
+                webauthn::compat::LoginResponseCompat::parse_str(&device_response_str)?;
 
             let user_id =
-                webauthn::login::finish_login_assertion(&store, &config, login_response, now_ms)
+                webauthn::ceremony::finish_assertion(&store, &config, login_response, None, now_ms)
                     .await?;
 
             let user = load_user_by_id(&db, &user_id).await?;
@@ -847,17 +837,8 @@ pub async fn token(
             }
 
             // Look up PRF material for the authenticated credential
-            let prf_option = if let Some(row_id) =
-                webauthn::store::get_login_row_id_by_credential_id(&db, &credential_id).await?
-            {
-                let creds = webauthn::store::list_login_credentials_with_prf(&db, &user.id).await?;
-                creds
-                    .iter()
-                    .find(|c| c.id == row_id)
-                    .and_then(|c| c.to_prf_option())
-            } else {
-                None
-            };
+            let prf_option =
+                webauthn::prf::get_prf_option_by_credential_id(&db, &credential_id).await?;
 
             generate_tokens_and_response_with_prf(
                 user,
@@ -963,7 +944,7 @@ pub async fn webauthn_assertion_options(
     let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
     let now_ms = webauthn::now_ms();
 
-    let opts = webauthn::login::start_login_assertion(&store, &config, now_ms).await?;
+    let opts = webauthn::ceremony::start_login_assertion(&store, &config, now_ms).await?;
     let options_json = opts.to_bitwarden_json();
 
     Ok(Json(serde_json::json!({
