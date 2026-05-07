@@ -43,7 +43,7 @@ pub async fn post_attestation_options(
     user.verify_password_or_otp(&data).await?;
 
     let config = webauthn::build_passkey_config(&base_url);
-    let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+    let store = webauthn::store::D1PasskeyStore::for_login(&db);
     let now_ms = webauthn::now_ms();
     let display_name = user.name.as_deref().unwrap_or(&email);
 
@@ -94,9 +94,11 @@ pub async fn post_webauthn_credential(
 
     let config = webauthn::build_passkey_config(&base_url);
     let row_id = uuid::Uuid::new_v4().to_string();
-    let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login)
-        .with_original_name(data.name.clone())
-        .with_predetermined_row_id(row_id.clone());
+    let store = webauthn::store::D1PasskeyStore::for_login_registration(
+        &db,
+        row_id.clone(),
+        data.name.clone(),
+    );
     let now_ms = webauthn::now_ms();
 
     let reg_response = webauthn::compat::RegistrationResponseCompat::parse(
@@ -149,7 +151,7 @@ pub async fn post_assertion_options(
     user.verify_password_or_otp(&data).await?;
 
     let config = webauthn::build_passkey_config(&base_url);
-    let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+    let store = webauthn::store::D1PasskeyStore::for_login(&db);
     let now_ms = webauthn::now_ms();
 
     let opts = webauthn::ceremony::start_login_assertion(&store, &config, now_ms).await?;
@@ -187,7 +189,7 @@ pub async fn put_webauthn_credential(
     let db = db::get_db(&env)?;
 
     let config = webauthn::build_passkey_config(&base_url);
-    let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+    let store = webauthn::store::D1PasskeyStore::for_login(&db);
     let now_ms = webauthn::now_ms();
 
     let (credential_id, login_response) =

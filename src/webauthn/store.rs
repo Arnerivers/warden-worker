@@ -44,51 +44,91 @@ impl CredentialUsage {
     }
 }
 
+/// Per-request store mode. Each variant carries exactly the data its business
+/// scenario requires — invalid combinations are unrepresentable.
+#[derive(Debug)]
+pub enum StoreMode {
+    /// Assertion (start/finish) or registration-start for login passkeys.
+    Login,
+    /// Assertion (start/finish) or registration-start for 2FA WebAuthn.
+    TwoFactor,
+    /// Registration-finish for a login passkey.
+    LoginRegistration {
+        row_id: String,
+        original_name: String,
+    },
+    /// Registration-finish for a 2FA WebAuthn credential.
+    TwoFactorRegistration {
+        provider_id: i32,
+        original_name: String,
+    },
+}
+
+impl StoreMode {
+    pub fn usage(&self) -> CredentialUsage {
+        match self {
+            Self::Login | Self::LoginRegistration { .. } => CredentialUsage::Login,
+            Self::TwoFactor | Self::TwoFactorRegistration { .. } => CredentialUsage::TwoFactor,
+        }
+    }
+}
+
 /// D1-backed implementation of `PasskeyStore`.
 ///
-/// `usage` controls which kind of credential gets created ("twofactor" or "login").
+/// Constructed via scene-specific constructors that enforce valid data
+/// combinations at the type level.
 pub struct D1PasskeyStore<'a> {
     db: &'a Db,
-    usage: CredentialUsage,
-    /// Saved as `provider_id` in [WebauthnCredentialRow].
-    requested_twofactor_provider_id: Option<i32>,
-    /// When set, `create_passkey` uses this as the stored display name instead
-    /// of the library-provided name (which has AAGUID appended).  The AAGUID is
-    /// derived from the difference and written to the `aaguid` column.
-    original_name: Option<String>,
-    /// When set, `create_passkey` uses this as the row id instead of generating
-    /// a new UUID. Allows callers to know the row id without a query-back.
-    predetermined_row_id: Option<String>,
+    mode: StoreMode,
 }
 
 impl<'a> D1PasskeyStore<'a> {
-    pub fn new(db: &'a Db, usage: CredentialUsage) -> Self {
+    /// Store for login assertion or registration-start (read + state ops only).
+    pub fn for_login(db: &'a Db) -> Self {
         Self {
             db,
-            usage,
-            requested_twofactor_provider_id: None,
-            original_name: None,
-            predetermined_row_id: None,
+            mode: StoreMode::Login,
         }
     }
 
-    pub fn with_requested_twofactor_provider_id(mut self, provider_id: i32) -> Self {
-        self.requested_twofactor_provider_id = Some(provider_id);
-        self
+    /// Store for 2FA assertion or registration-start (read + state ops only).
+    pub fn for_twofactor(db: &'a Db) -> Self {
+        Self {
+            db,
+            mode: StoreMode::TwoFactor,
+        }
     }
 
-    pub fn with_original_name(mut self, name: String) -> Self {
-        self.original_name = Some(name);
-        self
+    /// Store for completing a login passkey registration.
+    pub fn for_login_registration(db: &'a Db, row_id: String, original_name: String) -> Self {
+        Self {
+            db,
+            mode: StoreMode::LoginRegistration {
+                row_id,
+                original_name,
+            },
+        }
     }
 
-    pub fn with_predetermined_row_id(mut self, id: String) -> Self {
-        self.predetermined_row_id = Some(id);
-        self
+    /// Store for completing a 2FA WebAuthn credential registration.
+    pub fn for_twofactor_registration(db: &'a Db, provider_id: i32, original_name: String) -> Self {
+        Self {
+            db,
+            mode: StoreMode::TwoFactorRegistration {
+                provider_id,
+                original_name,
+            },
+        }
     }
 
     pub(crate) fn usage(&self) -> CredentialUsage {
-        self.usage
+        self.mode.usage()
+    }
+
+    /// Prefix a state id with the usage namespace to prevent cross-usage
+    /// collisions (e.g. simultaneous login + 2FA registrations for the same user).
+    fn scoped_state_id(&self, id: &str) -> String {
+        format!("{}:{}", self.mode.usage().as_str(), id)
     }
 }
 
@@ -206,33 +246,31 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
         counter: i64,
         created_at: i64,
     ) -> PkResult<()> {
-        let row_id = self
-            .predetermined_row_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let provider_id = if self.usage == CredentialUsage::TwoFactor {
-            Some(
-                self.requested_twofactor_provider_id
-                    .ok_or_else(|| pk_err("missing twofactor provider id"))?,
-            )
-        } else {
-            None
+        let (row_id, provider_id, original_name) = match &self.mode {
+            StoreMode::LoginRegistration {
+                row_id,
+                original_name,
+            } => (row_id.clone(), None, original_name.as_str()),
+            StoreMode::TwoFactorRegistration {
+                provider_id,
+                original_name,
+            } => (
+                uuid::Uuid::new_v4().to_string(),
+                Some(*provider_id),
+                original_name.as_str(),
+            ),
+            _ => return Err(pk_err("create_passkey requires a registration-mode store")),
         };
 
         // passkey-server's finish_registration formats name as "{name}-{aaguid}".
-        // When original_name is set, use it for the display name and extract the
-        // AAGUID from the suffix that the library appended.
-        let (display_name, aaguid) = if let Some(ref orig) = self.original_name {
-            let prefix = format!("{}-", orig);
-            let aaguid = if let Some(suffix) = name.strip_prefix(&prefix) {
-                uuid::Uuid::parse_str(suffix).ok().map(|u| u.to_string())
-            } else {
-                None
-            };
-            (orig.as_str(), aaguid)
-        } else {
-            (name, None)
-        };
+        // Use original_name for the display name and extract the AAGUID from the
+        // suffix that the library appended.
+        let prefix = format!("{}-", original_name);
+        let aaguid = name
+            .strip_prefix(&prefix)
+            .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+            .map(|u| u.to_string());
+        let display_name = original_name;
 
         self.db
             .prepare(format!(
@@ -242,7 +280,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
             .bind(&[
                 row_id.into(),
                 user_id.into(),
-                self.usage.as_str().into(),
+                self.mode.usage().as_str().into(),
                 provider_id.map(Into::into).unwrap_or(JsValue::NULL),
                 display_name.to_string().into(),
                 cred_id.to_string().into(),
@@ -269,7 +307,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
                 "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials \
                  WHERE credential_id = ?1 AND usage = ?2",
             ))
-            .bind(&[cred_id.into(), self.usage.as_str().into()])
+            .bind(&[cred_id.into(), self.mode.usage().as_str().into()])
             .map_err(|e| pk_err(format!("bind error: {e}")))?
             .first(None)
             .await
@@ -287,7 +325,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
                 "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials \
                  WHERE user_id = ?1 AND usage = ?2 ORDER BY created_at ASC",
             ))
-            .bind(&[user_id.into(), self.usage.as_str().into()])
+            .bind(&[user_id.into(), self.mode.usage().as_str().into()])
             .map_err(|e| pk_err(format!("bind error: {e}")))?
             .all()
             .await
@@ -339,6 +377,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
     }
 
     async fn save_state(&self, id: &str, state_json: &str, expires_at: i64) -> PkResult<()> {
+        let scoped_id = self.scoped_state_id(id);
         let now_ms = crate::webauthn::now_ms();
         let insert = self
             .db
@@ -347,7 +386,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
                  VALUES (?1, ?2, ?3, ?4)",
             )
             .bind(&[
-                id.into(),
+                scoped_id.as_str().into(),
                 state_json.into(),
                 d1_i64(expires_at),
                 d1_i64(now_ms),
@@ -367,6 +406,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
     }
 
     async fn get_state(&self, id: &str) -> PkResult<Option<PasskeyState>> {
+        let scoped_id = self.scoped_state_id(id);
         let now_ms = crate::webauthn::now_ms();
         let row: Option<serde_json::Value> = self
             .db
@@ -374,7 +414,7 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
                 "SELECT id, state_json, expires_at FROM webauthn_states \
                  WHERE id = ?1 AND expires_at > ?2",
             )
-            .bind(&[id.into(), d1_i64(now_ms)])
+            .bind(&[scoped_id.as_str().into(), d1_i64(now_ms)])
             .map_err(|e| pk_err(format!("bind error: {e}")))?
             .first(None)
             .await
@@ -385,9 +425,10 @@ impl<'a> PasskeyStore for D1PasskeyStore<'a> {
     }
 
     async fn delete_state(&self, id: &str) -> PkResult<()> {
+        let scoped_id = self.scoped_state_id(id);
         self.db
             .prepare("DELETE FROM webauthn_states WHERE id = ?1")
-            .bind(&[id.into()])
+            .bind(&[scoped_id.as_str().into()])
             .map_err(|e| pk_err(format!("bind error: {e}")))?
             .run()
             .await

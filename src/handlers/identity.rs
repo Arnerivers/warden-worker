@@ -414,8 +414,7 @@ async fn build_webauthn_assertion_payload(
     }
 
     let config = webauthn::build_passkey_config(base_url);
-    let store =
-        webauthn::store::D1PasskeyStore::new(db, webauthn::store::CredentialUsage::TwoFactor);
+    let store = webauthn::store::D1PasskeyStore::for_twofactor(db);
     let now_ms = webauthn::now_ms();
     let opts = webauthn::ceremony::start_2fa_assertion(&store, &config, &wa_creds, now_ms).await?;
 
@@ -434,6 +433,28 @@ async fn build_twofactor_required_payload(
         twofactor_ids,
         webauthn_assertion.as_ref(),
     ))
+}
+
+// Push device registion should not block login
+fn register_push_device(env: Env, db: crate::db::Db, mut device: Device) {
+    crate::background::spawn_background(async move {
+        if device.push_token.is_some() && device.is_push_device() {
+            if let Ok(Some(cfg)) = push::push_config(&env) {
+                match push::register_push_device(&cfg, &mut device).await {
+                    Ok(push_uuid_created) => {
+                        if push_uuid_created {
+                            if let Err(e) = device.persist_push_uuid(&db).await {
+                                log::warn!("Push uuid persistence on login failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Push re-registration on login failed: {e}");
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn generate_tokens_and_response(
@@ -650,10 +671,7 @@ pub async fn token(
                     }
                     Some(TwoFactorType::Webauthn) => {
                         let config = webauthn::build_passkey_config(&base_url);
-                        let store = webauthn::store::D1PasskeyStore::new(
-                            &db,
-                            webauthn::store::CredentialUsage::TwoFactor,
-                        );
+                        let store = webauthn::store::D1PasskeyStore::for_twofactor(&db);
                         let now_ms = webauthn::now_ms();
 
                         let (_, login_response) =
@@ -757,30 +775,17 @@ pub async fn token(
                 device.touch(&db).await?;
             }
 
-            if device.push_token.is_some() && device.is_push_device() {
-                if let Ok(Some(cfg)) = push::push_config(&env) {
-                    match push::register_push_device(&cfg, &mut device).await {
-                        Ok(push_uuid_created) => {
-                            if push_uuid_created {
-                                if let Err(e) = device.persist_push_uuid(&db).await {
-                                    log::warn!("Push uuid persistence on login failed: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Push re-registration on login failed: {e}");
-                        }
-                    }
-                }
-            }
-
-            generate_tokens_and_response(
+            let response = generate_tokens_and_response(
                 user,
                 &device,
                 &device_request.client_id,
                 &env,
                 two_factor_remember_token,
-            )
+            );
+
+            register_push_device((*env).clone(), db, device);
+
+            response
         }
         "webauthn" => {
             let device_response_str =
@@ -796,8 +801,7 @@ pub async fn token(
             };
 
             let config = webauthn::build_passkey_config(&base_url);
-            let store =
-                webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+            let store = webauthn::store::D1PasskeyStore::for_login(&db);
             let now_ms = webauthn::now_ms();
 
             let (credential_id, login_response) =
@@ -819,35 +823,22 @@ pub async fn token(
             .await?;
             device.touch(&db).await?;
 
-            if device.push_token.is_some() && device.is_push_device() {
-                if let Ok(Some(cfg)) = push::push_config(&env) {
-                    match push::register_push_device(&cfg, &mut device).await {
-                        Ok(push_uuid_created) => {
-                            if push_uuid_created {
-                                if let Err(e) = device.persist_push_uuid(&db).await {
-                                    log::warn!("Push uuid persistence on login failed: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Push re-registration on login failed: {e}");
-                        }
-                    }
-                }
-            }
-
             // Look up PRF material for the authenticated credential
             let prf_option =
                 webauthn::prf::get_prf_option_by_credential_id(&db, &credential_id).await?;
 
-            generate_tokens_and_response_with_prf(
+            let response = generate_tokens_and_response_with_prf(
                 user,
                 &device,
                 &device_request.client_id,
                 &env,
                 None,
                 prf_option,
-            )
+            );
+
+            register_push_device((*env).clone(), db, device);
+
+            response
         }
         "refresh_token" => {
             // When a refresh token is invalid or missing we need to respond with an HTTP BadRequest (400)
@@ -941,7 +932,7 @@ pub async fn webauthn_assertion_options(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
     let config = webauthn::build_passkey_config(&base_url);
-    let store = webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::Login);
+    let store = webauthn::store::D1PasskeyStore::for_login(&db);
     let now_ms = webauthn::now_ms();
 
     let opts = webauthn::ceremony::start_login_assertion(&store, &config, now_ms).await?;

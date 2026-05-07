@@ -485,8 +485,7 @@ pub async fn get_webauthn_challenge(
     user.verify_password_or_otp(&data).await?;
 
     let config = webauthn::build_passkey_config(&base_url);
-    let store =
-        webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::TwoFactor);
+    let store = webauthn::store::D1PasskeyStore::for_twofactor(&db);
     let now_ms = webauthn::now_ms();
 
     let display_name = user.name.as_deref().unwrap_or(&email);
@@ -549,9 +548,7 @@ pub async fn activate_webauthn(
 
     let config = webauthn::build_passkey_config(&base_url);
     let store =
-        webauthn::store::D1PasskeyStore::new(&db, webauthn::store::CredentialUsage::TwoFactor)
-            .with_requested_twofactor_provider_id(provider_id)
-            .with_original_name(name.clone());
+        webauthn::store::D1PasskeyStore::for_twofactor_registration(&db, provider_id, name.clone());
     let now_ms = webauthn::now_ms();
 
     let reg_response =
