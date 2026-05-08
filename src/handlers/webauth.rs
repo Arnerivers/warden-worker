@@ -62,7 +62,7 @@ pub async fn post_attestation_options(
     Ok(Json(json!({
         "options": options_json,
         "token": null,
-        "object": "webAuthnCredentialCreateOptions"
+        "object": "webauthnCredentialCreateOptions"
     })))
 }
 
@@ -74,8 +74,8 @@ pub struct CreateLoginCredentialRequest {
     pub device_response: Value,
     pub name: String,
     #[allow(dead_code)]
-    pub token: Option<String>,
-    pub supports_prf: Option<bool>,
+    pub token: String,
+    pub supports_prf: bool,
     pub encrypted_user_key: Option<String>,
     pub encrypted_public_key: Option<String>,
     pub encrypted_private_key: Option<String>,
@@ -115,11 +115,10 @@ pub async fn post_webauthn_credential(
     )
     .await?;
 
-    let supports_prf = data.supports_prf.unwrap_or(false);
     webauthn::prf::create_prf_credential(
         &db,
         &row_id,
-        supports_prf,
+        data.supports_prf,
         data.encrypted_user_key.as_deref(),
         data.encrypted_public_key.as_deref(),
         data.encrypted_private_key.as_deref(),
@@ -171,7 +170,7 @@ pub async fn post_assertion_options(
 pub struct UpdatePrfKeysRequest {
     pub device_response: Value,
     #[allow(dead_code)]
-    pub token: Option<String>,
+    pub token: String,
     pub encrypted_user_key: String,
     pub encrypted_public_key: String,
     pub encrypted_private_key: String,
@@ -185,7 +184,7 @@ pub async fn put_webauthn_credential(
     Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     AuthUser(user_id, _): AuthUser,
     Json(data): Json<UpdatePrfKeysRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(), AppError> {
     let db = db::get_db(&env)?;
 
     let config = webauthn::build_passkey_config(&base_url);
@@ -212,14 +211,7 @@ pub async fn put_webauthn_credential(
     )
     .await?;
 
-    let all_creds = webauthn::prf::list_login_credentials_with_prf(&db, &user_id).await?;
-    let resp_data: Vec<Value> = all_creds.iter().map(|c| c.to_response_json()).collect();
-
-    Ok(Json(json!({
-        "object": "list",
-        "data": resp_data,
-        "continuationToken": null
-    })))
+    Ok(())
 }
 
 /// POST /api/webauthn/{id}/delete — Delete a login passkey credential
@@ -230,7 +222,7 @@ pub async fn delete_webauthn_credential(
     AuthUser(user_id, _): AuthUser,
     Path(id): Path<String>,
     Json(data): Json<PasswordOrOtpData>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(), AppError> {
     let db = db::get_db(&env)?;
     let user = User::find_by_id(&db, &user_id).await?;
     user.verify_password_or_otp(&data).await?;
@@ -240,5 +232,5 @@ pub async fn delete_webauthn_credential(
         return Err(AppError::NotFound("Credential not found".into()));
     }
 
-    Ok(Json(json!({})))
+    Ok(())
 }
