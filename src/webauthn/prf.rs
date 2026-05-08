@@ -9,19 +9,9 @@ use crate::models::user::WebAuthnRotateKeyData;
 /// PRF status mirroring upstream `WebAuthnPrfStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrfStatus {
-    Enabled,
-    Supported,
-    Unsupported,
-}
-
-impl PrfStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Enabled => "Enabled",
-            Self::Supported => "Supported",
-            Self::Unsupported => "Unsupported",
-        }
-    }
+    Enabled = 0,
+    Supported = 1,
+    Unsupported = 2,
 }
 
 /// Joined credential + PRF for a user's login credentials with PRF enabled.
@@ -31,7 +21,7 @@ pub struct LoginCredentialWithPrf {
     pub credential_id: String,
     pub name: String,
     pub transports: String,
-    pub supports_prf: i64,
+    pub supports_prf: bool,
     pub encrypted_user_key: Option<String>,
     pub encrypted_public_key: Option<String>,
     pub encrypted_private_key: Option<String>,
@@ -39,7 +29,7 @@ pub struct LoginCredentialWithPrf {
 
 impl LoginCredentialWithPrf {
     pub fn prf_status(&self) -> PrfStatus {
-        if self.supports_prf == 0 {
+        if !self.supports_prf {
             return PrfStatus::Unsupported;
         }
         if self.encrypted_user_key.is_some()
@@ -61,10 +51,10 @@ impl LoginCredentialWithPrf {
         }
         let transports: Vec<String> = serde_json::from_str(&self.transports).unwrap_or_default();
         Some(serde_json::json!({
-            "EncryptedPrivateKey": self.encrypted_private_key,
-            "EncryptedUserKey": self.encrypted_user_key,
-            "CredentialId": self.credential_id,
-            "Transports": transports
+            "encryptedPrivateKey": self.encrypted_private_key,
+            "encryptedUserKey": self.encrypted_user_key,
+            "credentialId": self.credential_id,
+            "transports": transports
         }))
     }
 
@@ -74,7 +64,7 @@ impl LoginCredentialWithPrf {
         serde_json::json!({
             "id": self.id,
             "name": self.name,
-            "prfStatus": self.prf_status().as_str(),
+            "prfStatus": self.prf_status() as i32,
             "encryptedUserKey": self.encrypted_user_key,
             "encryptedPublicKey": self.encrypted_public_key,
             "object": "webAuthnCredential"
@@ -101,7 +91,7 @@ pub async fn create_prf_credential(
     )
     .bind(&[
         credential_row_id.into(),
-        d1_i64(supports_prf as i64),
+        supports_prf.into(),
         encrypted_user_key
             .map(Into::into)
             .unwrap_or(JsValue::NULL),

@@ -27,7 +27,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_webauthn_credentials_user_usage_provider_i
 -- PRF key material (only for usage='login' credentials)
 CREATE TABLE IF NOT EXISTS webauthn_prf_credentials (
     credential_row_id TEXT PRIMARY KEY NOT NULL,
-    supports_prf INTEGER NOT NULL,
+    supports_prf BOOLEAN NOT NULL,
     encrypted_user_key TEXT,
     encrypted_public_key TEXT,
     encrypted_private_key TEXT,
