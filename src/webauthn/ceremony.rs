@@ -42,7 +42,9 @@ pub async fn finish_ceremony_registration(
     response: passkey_server::types::RegistrationResponse,
     now_ms: i64,
 ) -> Result<(), AppError> {
-    finish_registration(store, user_id, config, response, now_ms)
+    let aligned_config =
+        super::verify_origin_and_align_config(config, &response.response.client_data_json);
+    finish_registration(store, user_id, &aligned_config, response, now_ms)
         .await
         .map_err(|e| {
             log::error!("WebAuthn registration verification failed: {e}");
@@ -115,7 +117,9 @@ pub async fn finish_assertion(
     expected_user_id: Option<&str>,
     now_ms: i64,
 ) -> Result<String, AppError> {
-    let returned_user_id = finish_login(store, config, response, now_ms)
+    let aligned_config =
+        super::verify_origin_and_align_config(config, &response.response.client_data_json);
+    let returned_user_id = finish_login(store, &aligned_config, response, now_ms)
         .await
         .map_err(|e| {
             log::error!("WebAuthn assertion verification failed: {e}");
