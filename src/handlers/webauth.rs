@@ -74,7 +74,7 @@ pub struct CreateLoginCredentialRequest {
     pub device_response: Value,
     pub name: String,
     #[allow(dead_code)]
-    pub token: String,
+    pub token: Option<String>,
     pub supports_prf: bool,
     pub encrypted_user_key: Option<String>,
     pub encrypted_public_key: Option<String>,
