@@ -21,7 +21,7 @@ pub struct LoginCredentialWithPrf {
     pub credential_id: String,
     pub name: String,
     pub transports: String,
-    pub supports_prf: bool,
+    pub supports_prf: i32,
     pub encrypted_user_key: Option<String>,
     pub encrypted_public_key: Option<String>,
     pub encrypted_private_key: Option<String>,
@@ -29,7 +29,7 @@ pub struct LoginCredentialWithPrf {
 
 impl LoginCredentialWithPrf {
     pub fn prf_status(&self) -> PrfStatus {
-        if !self.supports_prf {
+        if self.supports_prf == 0 {
             return PrfStatus::Unsupported;
         }
         if self.encrypted_user_key.is_some()
@@ -91,7 +91,7 @@ pub async fn create_prf_credential(
     )
     .bind(&[
         credential_row_id.into(),
-        supports_prf.into(),
+        (supports_prf as i32).into(),
         encrypted_user_key
             .map(Into::into)
             .unwrap_or(JsValue::NULL),
